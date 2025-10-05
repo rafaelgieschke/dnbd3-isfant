@@ -26,6 +26,10 @@
 #include "altservers.h"
 #include "reference.h"
 
+#include "spdk/iscsi_spec.h"
+#include "spdk/scsi_spec.h"
+#include <endian.h>
+
 #include <dnbd3/shared/sockhelper.h>
 #include <dnbd3/shared/timing.h>
 #include <dnbd3/shared/protocol.h>
@@ -60,22 +64,37 @@ static void removeFromList(dnbd3_client_t *client);
 static dnbd3_client_t* freeClientStruct(dnbd3_client_t *client);
 static void uplinkCallback(void *data, uint64_t handle, uint64_t start, uint32_t length, const char *buffer);
 
-static inline bool recv_request_header(int sock, dnbd3_request_t *request)
+static inline bool recv_request_header_raw(dnbd3_client_t *client, void *request, size_t size)
 {
+	int sock = client->sock;
 	ssize_t ret, fails = 0;
 #ifdef DNBD3_SERVER_AFL
 	sock = 0;
 #endif
 	// Read request header from socket
-	while ( ( ret = recv( sock, request, sizeof(*request), MSG_WAITALL ) ) != sizeof(*request) ) {
+	while ( ( ret = recv( sock, request, size, MSG_WAITALL ) ) != size ) {
 		if ( errno == EINTR && ++fails < 10 ) continue;
 		if ( ret >= 0 || ++fails > SOCKET_TIMEOUT_CLIENT_RETRIES ) return false;
 		if ( errno == EAGAIN ) continue;
-		logadd( LOG_DEBUG2, "Error receiving request: Could not read message header (%d/%d, e=%d)\n", (int)ret, (int)sizeof(*request), errno );
+		logadd( LOG_DEBUG2, "Error receiving request: Could not read message header (%d/%d, e=%d)\n", (int)ret, (int)size, errno );
 		return false;
 	}
-	// Make sure all bytes are in the right order (endianness)
-	fixup_request( *request );
+	return true;
+}
+
+static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscsi_bhs *bhs, dnbd3_request_t *request );
+
+static inline bool recv_request_header( dnbd3_client_t *client, dnbd3_request_t *request )
+{
+	if ( client->iscsi ) {
+		struct iscsi_bhs bhs;
+		if ( !recv_request_header_raw( client, &bhs, sizeof bhs ) ) return false;
+		if ( !translate_iscsi_to_dndb3( client, &bhs, request ) ) return false;
+	} else {
+		if ( !recv_request_header_raw( client, request, sizeof *request ) ) return false;
+		// Make sure all bytes are in the right order (endianness)
+		fixup_request( *request );
+	}
 	if ( request->magic != dnbd3_packet_magic ) {
 		logadd( LOG_DEBUG2, "Magic in client request incorrect (cmd: %d, len: %d)\n", (int)request->cmd, (int)request->size );
 		return false;
@@ -110,15 +129,9 @@ static inline bool recv_request_payload(int sock, uint32_t size, serialized_buff
 	return true;
 }
 
-/**
- * Send reply with optional payload. payload can be null. The caller has to
- * acquire the sendMutex first.
- */
-static inline bool send_reply(int sock, dnbd3_reply_t *reply, const void *payload)
+static inline bool send_reply_raw(int sock, const void *reply, size_t reply_size, const void *payload, size_t size )
 {
-	const uint32_t size = reply->size;
-	fixup_reply( *reply );
-	if ( sock_sendAll( sock, reply, sizeof(dnbd3_reply_t), 1 ) != sizeof(dnbd3_reply_t) ) {
+	if ( sock_sendAll( sock, reply, reply_size, 1 ) != reply_size ) {
 		logadd( LOG_DEBUG1, "Sending reply header to client failed" );
 		return false;
 	}
@@ -129,6 +142,57 @@ static inline bool send_reply(int sock, dnbd3_reply_t *reply, const void *payloa
 		}
 	}
 	return true;
+}
+
+static inline bool sendPadding( const int fd, uint32_t bytes );
+
+static inline bool send_reply_iscsi( dnbd3_client_t *client, struct iscsi_bhs *reply, const void *payload, size_t size )
+{
+	reply->data_segment_len[0] = size >> 16;
+	reply->data_segment_len[1] = size >> 8;
+	reply->data_segment_len[2] = size >> 0;
+	((struct iscsi_bhs_scsi_resp *)reply)->exp_cmd_sn = htobe32( client->exp_cmd_sn );
+	((struct iscsi_bhs_scsi_resp *)reply)->max_cmd_sn = htobe32( client->exp_cmd_sn + 0x100 );
+	if ( !send_reply_raw( client->sock, reply, sizeof *reply, payload, size ) ) {
+		return false;
+	}
+	return sendPadding( client->sock, ISCSI_ALIGN( size ) - size );
+}
+
+static inline bool send_reply_iscsi_lock( dnbd3_client_t *client, struct iscsi_bhs *reply, const void *payload, size_t size )
+{
+	mutex_lock( &client->sendMutex );
+	bool ret = send_reply_iscsi( client, reply, payload, size );
+	mutex_unlock( &client->sendMutex );
+	return ret;
+}
+
+/**
+ * Send reply with optional payload. payload can be null. The caller has to
+ * acquire the sendMutex first.
+ */
+static inline bool send_reply( dnbd3_client_t *client, dnbd3_reply_t *reply, const void *payload )
+{
+	const uint32_t size = reply->size;
+	if ( client->iscsi ) {
+		struct iscsi_bhs bhs = { 0 };
+		bhs.itt = reply->handle;
+		switch (reply->cmd) {
+			case CMD_SELECT_IMAGE:
+				bhs.opcode = ISCSI_OP_LOGIN_RSP;
+				bhs.flags = ISCSI_LOGIN_TRANSIT | ISCSI_LOGIN_CURRENT_STAGE_0 | ISCSI_LOGIN_NEXT_STAGE_3;
+				break;
+			case CMD_GET_BLOCK:
+				bhs.opcode = ISCSI_OP_SCSI_DATAIN;
+				bhs.flags = ISCSI_FLAG_FINAL | ISCSI_DATAIN_STATUS;
+				break;
+			case CMD_KEEPALIVE:
+				return true;
+		}
+		return send_reply_iscsi( client, &bhs, payload, size );
+	}
+	fixup_reply( *reply );
+	return send_reply_raw( client->sock, reply, sizeof(*reply), payload, size );
 }
 
 /**
@@ -149,6 +213,76 @@ static inline bool sendPadding( const int fd, uint32_t bytes )
 void net_init()
 {
 	mutex_init( &_clients_lock, LOCK_CLIENT_LIST );
+}
+
+static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscsi_bhs *bhs, dnbd3_request_t *request )
+{
+	client->exp_cmd_sn = be32toh( ((struct iscsi_bhs_scsi_req*)bhs)->cmd_sn ) + ( bhs->immediate ? 0 : 1 );
+	request->magic = dnbd3_packet_magic;
+	request->cmd = CMD_KEEPALIVE;
+	request->size = ISCSI_ALIGN( bhs->data_segment_len[0] << 16 | bhs->data_segment_len[1] << 8 | bhs->data_segment_len[2] );
+	request->handle = bhs->itt;
+
+	switch ( bhs->opcode ) {
+		case ISCSI_OP_LOGIN: {
+			struct iscsi_bhs_login_req *req = (struct iscsi_bhs_login_req *)bhs;
+			request->cmd = CMD_SELECT_IMAGE;
+			return true;
+		}
+		case ISCSI_OP_LOGOUT:
+			return false;
+		case ISCSI_OP_NOPOUT: {
+			struct iscsi_bhs_nop_in resp = { ISCSI_OP_NOPIN };
+			resp.itt = bhs->itt;
+			resp.flags = ISCSI_FLAG_FINAL;
+			resp.ttt = 0xffffffff;
+			return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, NULL, 0 );
+		}
+		case ISCSI_OP_SCSI: {
+			struct iscsi_bhs_scsi_req *req = (struct iscsi_bhs_scsi_req *)bhs;
+			switch ( req->cdb[0] ) {
+				case SPDK_SPC_TEST_UNIT_READY: {
+					struct iscsi_bhs_scsi_resp resp = { ISCSI_OP_SCSI_RSP };
+					resp.itt = req->itt;
+					resp.flags = ISCSI_FLAG_FINAL;
+					return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, NULL, 0 );
+				}
+				case SPDK_SPC_INQUIRY: {
+					struct iscsi_bhs_data_in resp = { ISCSI_OP_SCSI_DATAIN };
+					resp.itt = req->itt;
+					resp.flags = ISCSI_FLAG_FINAL | ISCSI_DATAIN_STATUS;
+					struct spdk_scsi_cdb_inquiry_data data = { .peripheral_device_type = 0, .version = 5, .response = 2, .add_len = sizeof data - 4, .t10_vendor_id = "IET     ", .product_id = "VIRTUAL-DISK    ", .product_rev = "0001" };
+					return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, &data, sizeof data );
+				}
+				case SPDK_SPC_MODE_SENSE_6: {
+					struct iscsi_bhs_data_in resp = { ISCSI_OP_SCSI_DATAIN };
+					resp.itt = req->itt;
+					resp.flags = ISCSI_FLAG_FINAL | ISCSI_DATAIN_STATUS;
+					uint8_t bytes[4] = { sizeof bytes - 4, 0, 0b10000000, 0 };
+					return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, bytes, sizeof bytes );
+				}
+				case SPDK_SPC_SERVICE_ACTION_IN_16:
+					switch ( req->cdb[1] & 0x1f ) {
+						case SPDK_SBC_SAI_READ_CAPACITY_16: {
+							struct iscsi_bhs_data_in resp = { ISCSI_OP_SCSI_DATAIN };
+							resp.itt = req->itt;
+							resp.flags = ISCSI_FLAG_FINAL | ISCSI_DATAIN_STATUS;
+							uint64_t size = client->image ? ( client->image->virtualFilesize / 512 - 1 ) : 0;
+							uint8_t bytes[32] = { size >> 56, size >> 48, size >> 40, size >> 32, size >> 24, size >> 16, size >> 8, size, 0, 0, 2, 0 };
+							return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, bytes, sizeof bytes );
+						}
+					}
+					break;
+				case SPDK_SBC_READ_10:
+					request->cmd = CMD_GET_BLOCK;
+					request->size = ( req->cdb[7] << 8 | req->cdb[8] ) * 512;
+					request->offset = ( (uint64_t)req->cdb[2] << 24 | (uint64_t)req->cdb[3] << 16 | (uint64_t)req->cdb[4] << 8 | (uint64_t)req->cdb[5] ) * 512;
+					return true;
+			}
+		}
+    }
+	logadd( LOG_WARNING, "Unsupported (i)SCSI command 0x%02x/0x%02x received from iSCSI client %s", bhs->opcode, ((struct iscsi_bhs_scsi_req *)bhs)->cdb[0], client->hostName );
+	return false;
 }
 
 void* net_handleNewConnection(void *clientPtr)
@@ -172,6 +306,17 @@ void* net_handleNewConnection(void *clientPtr)
 			goto fail_preadd;
 		}
 
+		if ( ((char*)&request)[0] == 'C' ) {
+			client->iscsi = 1;
+			struct iscsi_bhs bhs;
+			memcpy( &bhs, &request, sizeof request );
+			const int ret = (int)recv( client->sock, (char*)&bhs + sizeof request, sizeof bhs - sizeof request, MSG_WAITALL );
+			if ( ret != (int)( sizeof bhs - sizeof request ) ) {
+				logadd( LOG_DEBUG2, "Error receiving request: Could not read iSCSI extra message header (%d/%d, e=%d)", (int)ret, (int)( sizeof bhs - sizeof request ), errno );
+				goto fail_preadd;
+			}
+			translate_iscsi_to_dndb3( client, &bhs, &request );
+		}
 		if ( request.magic != dnbd3_packet_magic ) {
 			// Let's see if this looks like an HTTP request
 			if ( ((char*)&request)[0] == 'G' || ((char*)&request)[0] == 'P' ) {
@@ -183,7 +328,7 @@ void* net_handleNewConnection(void *clientPtr)
 			goto fail_preadd;
 		}
 		// Magic OK, untangle byte order if required
-		fixup_request( request );
+		if ( !client->iscsi ) fixup_request( request );
 		if ( request.cmd != CMD_SELECT_IMAGE ) {
 			logadd( LOG_WARNING, "Client sent != CMD_SELECT_IMAGE in handshake (got cmd=%d, size=%d), dropping client.", (int)request.cmd, (int)request.size );
 			goto fail_preadd;
@@ -229,10 +374,22 @@ void* net_handleNewConnection(void *clientPtr)
 	// Receive first packet's payload
 	if ( recv_request_payload( client->sock, request.size, &payload ) ) {
 		char *image_name;
-		client_version = serializer_get_uint16( &payload );
-		image_name = serializer_get_string( &payload );
-		rid = serializer_get_uint16( &payload );
-		const uint8_t flags = serializer_get_uint8( &payload );
+		uint8_t flags;
+		if ( client->iscsi ) {
+			client_version = MIN_SUPPORTED_CLIENT;
+			for (char *keyValue; ( keyValue = serializer_get_string( &payload ) ) != NULL; ) {
+				if (strncmp(keyValue, "TargetName=", strlen( "TargetName=" ) ) == 0) {
+					image_name = keyValue + strlen ( "TargetName=" );
+				}
+			}
+			rid = 1;
+			flags = 0;
+		} else {
+			client_version = serializer_get_uint16( &payload );
+			image_name = serializer_get_string( &payload );
+			rid = serializer_get_uint16( &payload );
+			flags = serializer_get_uint8( &payload );
+		}
 		client->isServer = ( flags & FLAGS8_SERVER );
 		if ( unlikely( request.size < 3 || !image_name || client_version < MIN_SUPPORTED_CLIENT ) ) {
 			if ( client_version < MIN_SUPPORTED_CLIENT ) {
@@ -294,13 +451,19 @@ void* net_handleNewConnection(void *clientPtr)
 					}
 					mutex_unlock( &image->lock );
 					serializer_reset_write( &payload );
-					serializer_put_uint16( &payload, client_version < 3 ? client_version : PROTOCOL_VERSION ); // XXX: Since messed up fuse client was messed up before :(
-					serializer_put_string( &payload, image->name );
-					serializer_put_uint16( &payload, (uint16_t)image->rid );
-					serializer_put_uint64( &payload, image->virtualFilesize );
+					if (client->iscsi) {
+						serializer_put_string( &payload, "HeaderDigest=None" );
+						serializer_put_string( &payload, "DataDigest=None" );
+					} else {
+						serializer_put_uint16( &payload, client_version < 3 ? client_version : PROTOCOL_VERSION ); // XXX: Since messed up fuse client was messed up before :(
+						serializer_put_string( &payload, image->name );
+						serializer_put_uint16( &payload, (uint16_t)image->rid );
+						serializer_put_uint64( &payload, image->virtualFilesize );
+					}
 					reply.cmd = CMD_SELECT_IMAGE;
+					reply.handle = request.handle;
 					reply.size = serializer_get_written_length( &payload );
-					if ( !send_reply( client->sock, &reply, &payload ) ) {
+					if ( !send_reply( client, &reply, &payload ) ) {
 						bOk = false;
 					}
 				}
@@ -316,18 +479,18 @@ void* net_handleNewConnection(void *clientPtr)
 			usleep( _clientPenalty );
 		}
 		// client handling mainloop
-		while ( recv_request_header( client->sock, &request ) ) {
+		while ( recv_request_header( client, &request ) ) {
 			if ( _shutdown ) break;
+			reply.handle = request.handle;
 			if ( likely ( request.cmd == CMD_GET_BLOCK ) ) {
 
 				const uint64_t offset = request.offset_small; // Copy to full uint64 to prevent repeated masking
-				reply.handle = request.handle;
 				if ( unlikely( offset >= image->virtualFilesize ) ) {
 					// Sanity check
 					logadd( LOG_WARNING, "Client %s requested non-existent block", client->hostName );
 					reply.size = 0;
 					reply.cmd = CMD_ERROR;
-					send_reply( client->sock, &reply, NULL );
+					send_reply( client, &reply, NULL );
 					continue;
 				}
 				if ( unlikely( offset + request.size > image->virtualFilesize ) ) {
@@ -335,7 +498,7 @@ void* net_handleNewConnection(void *clientPtr)
 					logadd( LOG_WARNING, "Client %s requested data block that extends beyond image size", client->hostName );
 					reply.size = 0;
 					reply.cmd = CMD_ERROR;
-					send_reply( client->sock, &reply, NULL );
+					send_reply( client, &reply, NULL );
 					continue;
 				}
 
@@ -372,11 +535,11 @@ void* net_handleNewConnection(void *clientPtr)
 				reply.cmd = CMD_GET_BLOCK;
 				reply.size = request.size;
 
-				fixup_reply( reply );
+				if ( !client->iscsi ) fixup_reply( reply );
 				const bool lock = image->uplinkref != NULL;
 				if ( lock ) mutex_lock( &client->sendMutex );
 				// Send reply header
-				if ( send( client->sock, &reply, sizeof(dnbd3_reply_t), (request.size == 0 ? 0 : MSG_MORE) ) != sizeof(dnbd3_reply_t) ) {
+				if ( client->iscsi ? !send_reply( client, &reply, NULL ) : send( client->sock, &reply, sizeof(dnbd3_reply_t), (request.size == 0 ? 0 : MSG_MORE) ) != sizeof(dnbd3_reply_t) ) {
 					if ( lock ) mutex_unlock( &client->sendMutex );
 					logadd( LOG_DEBUG1, "Sending CMD_GET_BLOCK reply header to %s failed", client->hostName );
 					goto exit_client_cleanup;
@@ -467,7 +630,7 @@ void* net_handleNewConnection(void *clientPtr)
 				reply.cmd = CMD_GET_SERVERS;
 				reply.size = (uint32_t)( num * sizeof(dnbd3_server_entry_t) );
 				mutex_lock( &client->sendMutex );
-				send_reply( client->sock, &reply, server_list );
+				send_reply( client, &reply, server_list );
 				mutex_unlock( &client->sendMutex );
 				goto set_name;
 				break;
@@ -476,7 +639,7 @@ void* net_handleNewConnection(void *clientPtr)
 				reply.cmd = CMD_KEEPALIVE;
 				reply.size = 0;
 				mutex_lock( &client->sendMutex );
-				send_reply( client->sock, &reply, NULL );
+				send_reply( client, &reply, NULL );
 				mutex_unlock( &client->sendMutex );
 set_name: ;
 				if ( !hasName ) {
@@ -494,10 +657,10 @@ set_name: ;
 				mutex_lock( &client->sendMutex );
 				if ( image->crc32 == NULL ) {
 					reply.size = 0;
-					send_reply( client->sock, &reply, NULL );
+					send_reply( client, &reply, NULL );
 				} else {
 					const uint32_t size = reply.size = (uint32_t)( (IMGSIZE_TO_HASHBLOCKS(image->realFilesize) + 1) * sizeof(uint32_t) );
-					send_reply( client->sock, &reply, NULL );
+					send_reply( client, &reply, NULL );
 					send( client->sock, &image->masterCrc32, sizeof(uint32_t), MSG_MORE );
 					send( client->sock, image->crc32, size - sizeof(uint32_t), 0 );
 				}
@@ -751,7 +914,7 @@ static void uplinkCallback(void *data, uint64_t handle, uint64_t start UNUSED, u
 		.size = length,
 	};
 	mutex_lock( &client->sendMutex );
-	send_reply( client->sock, &reply, buffer );
+	send_reply( client, &reply, buffer );
 	if ( buffer == NULL ) {
 		shutdown( client->sock, SHUT_RDWR );
 	}

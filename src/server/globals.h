@@ -177,6 +177,9 @@ struct _dnbd3_client
 	pthread_mutex_t sendMutex;        // Held while writing to sock if image is incomplete (since uplink uses socket too)
 	pthread_mutex_t lock;
 	pthread_t thread;
+
+	bool iscsi;
+	uint32_t exp_cmd_sn;
 };
 
 // #######################################################
