@@ -188,6 +188,13 @@ static inline bool send_reply( dnbd3_client_t *client, dnbd3_reply_t *reply, con
 				break;
 			case CMD_KEEPALIVE:
 				return true;
+			default: {
+				bhs.opcode = ISCSI_OP_SCSI_RSP;
+				bhs.flags = ISCSI_FLAG_FINAL;
+				((struct iscsi_bhs_scsi_resp *)&bhs)->status = SPDK_SCSI_STATUS_CHECK_CONDITION;
+				uint8_t data[20] = { (sizeof data - 2) >> 8, sizeof data - 2, 0x70, 0, SPDK_SCSI_SENSE_ILLEGAL_REQUEST, 0, 0, 0, 0, sizeof data - 2 - 8, 0, 0, 0, 0, SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE, SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE };
+				return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&bhs, &data, sizeof data );
+			}
 		}
 		return send_reply_iscsi( client, &bhs, payload, size );
 	}
@@ -221,55 +228,79 @@ static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscs
 	request->magic = dnbd3_packet_magic;
 	request->cmd = CMD_KEEPALIVE;
 	request->size = ISCSI_ALIGN( bhs->data_segment_len[0] << 16 | bhs->data_segment_len[1] << 8 | bhs->data_segment_len[2] );
+	if ( bhs->opcode != ISCSI_OP_LOGIN && request->size != 0 ) return false;
+	if ( bhs->total_ahs_len != 0 ) return false;
 	request->handle = bhs->itt;
 
+	struct iscsi_bhs resp = { 0 };
+	resp.itt = bhs->itt;
+	resp.flags = ISCSI_FLAG_FINAL;
 	switch ( bhs->opcode ) {
-		case ISCSI_OP_LOGIN: {
-			struct iscsi_bhs_login_req *req = (struct iscsi_bhs_login_req *)bhs;
+		case ISCSI_OP_LOGIN:
 			request->cmd = CMD_SELECT_IMAGE;
 			return true;
-		}
 		case ISCSI_OP_LOGOUT:
+			resp.opcode = ISCSI_OP_LOGOUT_RSP;
+			send_reply_iscsi_lock( client, &resp, NULL, 0 );
 			return false;
-		case ISCSI_OP_NOPOUT: {
-			struct iscsi_bhs_nop_in resp = { ISCSI_OP_NOPIN };
-			resp.itt = bhs->itt;
-			resp.flags = ISCSI_FLAG_FINAL;
+		case ISCSI_OP_NOPOUT:
+			resp.opcode = ISCSI_OP_NOPIN;
 			resp.ttt = 0xffffffff;
-			return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, NULL, 0 );
-		}
+			return send_reply_iscsi_lock( client, &resp, NULL, 0 );
+		case ISCSI_OP_TASK:
+			resp.opcode = ISCSI_OP_TASK_RSP;
+			return send_reply_iscsi_lock( client, &resp, NULL, 0 );
 		case ISCSI_OP_SCSI: {
 			struct iscsi_bhs_scsi_req *req = (struct iscsi_bhs_scsi_req *)bhs;
+			uint32_t expected_data_xfer_len = be32toh( req->expected_data_xfer_len );
+			resp.opcode = ISCSI_OP_SCSI_RSP;
+			if ( expected_data_xfer_len > 0 ) {
+				resp.opcode = ISCSI_OP_SCSI_DATAIN;
+				resp.flags |= ISCSI_DATAIN_STATUS;
+			}
 			switch ( req->cdb[0] ) {
-				case SPDK_SPC_TEST_UNIT_READY: {
-					struct iscsi_bhs_scsi_resp resp = { ISCSI_OP_SCSI_RSP };
-					resp.itt = req->itt;
-					resp.flags = ISCSI_FLAG_FINAL;
-					return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, NULL, 0 );
+				case SPDK_SPC_TEST_UNIT_READY:
+					return send_reply_iscsi_lock( client, &resp, NULL, 0 );
+				case SPDK_SPC_REPORT_LUNS: {
+					uint8_t data[] = { 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+					return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
 				}
 				case SPDK_SPC_INQUIRY: {
-					struct iscsi_bhs_data_in resp = { ISCSI_OP_SCSI_DATAIN };
-					resp.itt = req->itt;
-					resp.flags = ISCSI_FLAG_FINAL | ISCSI_DATAIN_STATUS;
-					struct spdk_scsi_cdb_inquiry_data data = { .peripheral_device_type = 0, .version = 5, .response = 2, .add_len = sizeof data - 4, .t10_vendor_id = "IET     ", .product_id = "VIRTUAL-DISK    ", .product_rev = "0001" };
-					return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, &data, sizeof data );
+					struct spdk_scsi_cdb_inquiry *inquiry = (struct spdk_scsi_cdb_inquiry *)&req->cdb;
+					switch ( inquiry->evpd & 0x01 ) {
+						case 0: {
+							struct spdk_scsi_cdb_inquiry_data data = { .peripheral_device_type = 0, .version = 4, .response = 2, .add_len = sizeof data - 4, .t10_vendor_id = "IET     ", .product_id = "VIRTUAL-DISK    ", .product_rev = "0001" };
+							return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
+						}
+						case 1: {
+							switch ( inquiry->page_code ) {
+								case 0x00: {
+									uint8_t data[6] = { 0x0, inquiry->page_code, (sizeof data - 4) >> 8, sizeof data - 4, 0x00, 0xb0 };
+									return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
+								}
+								case 0xb0: {
+									uint8_t data[64] = { 0x0, inquiry->page_code, (sizeof data - 4) >> 8, sizeof data - 4, 0x0, 0x80, 0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x2, 0x0 };
+									return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
+								}
+							}
+						}
+					}
 				}
 				case SPDK_SPC_MODE_SENSE_6: {
-					struct iscsi_bhs_data_in resp = { ISCSI_OP_SCSI_DATAIN };
-					resp.itt = req->itt;
-					resp.flags = ISCSI_FLAG_FINAL | ISCSI_DATAIN_STATUS;
-					uint8_t bytes[4] = { sizeof bytes - 4, 0, 0b10000000, 0 };
-					return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, bytes, sizeof bytes );
+					uint8_t data[24] = { sizeof data - 4, 0, 0b10000000, 0, 0x8, 0x12, 0x14, 0x0, 0xff, 0xff, 0x0, 0x0, 0xff, 0xff, 0xff, 0xff, 0x80, 0x14, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+					return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
+				}
+				case SPDK_SBC_READ_CAPACITY_10: {
+					uint32_t size = client->image ? ( client->image->virtualFilesize / 512 - 1 ) : 0;
+					uint8_t data[8] = { size >> 24, size >> 16, size >> 8, size, 0, 0, 2, 0 };
+					return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
 				}
 				case SPDK_SPC_SERVICE_ACTION_IN_16:
 					switch ( req->cdb[1] & 0x1f ) {
 						case SPDK_SBC_SAI_READ_CAPACITY_16: {
-							struct iscsi_bhs_data_in resp = { ISCSI_OP_SCSI_DATAIN };
-							resp.itt = req->itt;
-							resp.flags = ISCSI_FLAG_FINAL | ISCSI_DATAIN_STATUS;
 							uint64_t size = client->image ? ( client->image->virtualFilesize / 512 - 1 ) : 0;
-							uint8_t bytes[32] = { size >> 56, size >> 48, size >> 40, size >> 32, size >> 24, size >> 16, size >> 8, size, 0, 0, 2, 0 };
-							return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&resp, bytes, sizeof bytes );
+							uint8_t data[32] = { size >> 56, size >> 48, size >> 40, size >> 32, size >> 24, size >> 16, size >> 8, size, 0, 0, 2, 0 };
+							return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
 						}
 					}
 					break;
@@ -279,10 +310,16 @@ static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscs
 					request->offset = ( (uint64_t)req->cdb[2] << 24 | (uint64_t)req->cdb[3] << 16 | (uint64_t)req->cdb[4] << 8 | (uint64_t)req->cdb[5] ) * 512;
 					return true;
 			}
+			logadd( LOG_WARNING, "Unsupported SCSI command 0x%02x 0x%02x received from iSCSI client %s", req->cdb[0], req->cdb[1], client->hostName );
+			resp.opcode = ISCSI_OP_SCSI_RSP;
+			resp.flags = ISCSI_FLAG_FINAL;
+			((struct iscsi_bhs_scsi_resp *)&resp)->status = SPDK_SCSI_STATUS_CHECK_CONDITION;
+			uint8_t data[20] = { (sizeof data - 2) >> 8, sizeof data - 2, 0x70, 0, SPDK_SCSI_SENSE_ILLEGAL_REQUEST, 0, 0, 0, 0, sizeof data - 2 - 8, 0, 0, 0, 0, SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE, SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE };
+			return send_reply_iscsi_lock( client, &resp, &data, sizeof data );
 		}
     }
-	logadd( LOG_WARNING, "Unsupported (i)SCSI command 0x%02x/0x%02x received from iSCSI client %s", bhs->opcode, ((struct iscsi_bhs_scsi_req *)bhs)->cdb[0], client->hostName );
-	return false;
+	logadd( LOG_WARNING, "Unsupported iSCSI command 0x%02x received from iSCSI client %s", bhs->opcode, client->hostName );
+	return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&(struct iscsi_bhs_reject){ .opcode = ISCSI_OP_REJECT, .flags = ISCSI_FLAG_FINAL, .reason = ISCSI_REASON_CMD_NOT_SUPPORTED, .ffffffff = 0xffffffff }, bhs, sizeof *bhs );
 }
 
 void* net_handleNewConnection(void *clientPtr)
@@ -293,6 +330,7 @@ void* net_handleNewConnection(void *clientPtr)
 
 	// Await data from client. Since this is a fresh connection, we expect data right away
 	sock_setTimeout( client->sock, _clientTimeout );
+	setsockopt( client->sock, IPPROTO_TCP, TCP_NODELAY, &(int){1}, sizeof (int) );
 	do {
 #ifdef DNBD3_SERVER_AFL
 		const int ret = (int)recv( 0, &request, sizeof(request), MSG_WAITALL );
@@ -377,13 +415,23 @@ void* net_handleNewConnection(void *clientPtr)
 		uint8_t flags;
 		if ( client->iscsi ) {
 			client_version = MIN_SUPPORTED_CLIENT;
+			rid = 1;
+			flags = 0;
 			for (char *keyValue; ( keyValue = serializer_get_string( &payload ) ) != NULL; ) {
 				if (strncmp(keyValue, "TargetName=", strlen( "TargetName=" ) ) == 0) {
 					image_name = keyValue + strlen ( "TargetName=" );
+					for ( char *c = image_name; *c; c++ ) if ( *c == ':' ) *c = '/';
+					char *dot = strrchr( image_name, '.' );
+					if ( dot != NULL && dot[1] == 'r' && dot[2] != '\0' ) {
+						char *end = NULL;
+						unsigned long tmp_rid = strtoul( dot + 2, &end, 10 );
+						if ( end[0] == '\0' ) {
+							rid = (uint16_t)tmp_rid;
+							*dot = '\0';
+						}
+					}
 				}
 			}
-			rid = 1;
-			flags = 0;
 		} else {
 			client_version = serializer_get_uint16( &payload );
 			image_name = serializer_get_string( &payload );
@@ -452,8 +500,22 @@ void* net_handleNewConnection(void *clientPtr)
 					mutex_unlock( &image->lock );
 					serializer_reset_write( &payload );
 					if (client->iscsi) {
+						serializer_put_string( &payload, "TargetPortalGroupTag=1" );
 						serializer_put_string( &payload, "HeaderDigest=None" );
 						serializer_put_string( &payload, "DataDigest=None" );
+						serializer_put_string( &payload, "DefaultTime2Wait=2" );
+						serializer_put_string( &payload, "DefaultTime2Retain=0" );
+						serializer_put_string( &payload, "IFMarker=No" );
+						serializer_put_string( &payload, "OFMarker=No" );
+						serializer_put_string( &payload, "ErrorRecoveryLevel=0" );
+						serializer_put_string( &payload, "InitialR2T=Yes" );
+						serializer_put_string( &payload, "ImmediateData=Yes" );
+						serializer_put_string( &payload, "MaxBurstLength=262144" );
+						serializer_put_string( &payload, "FirstBurstLength=65536" );
+						serializer_put_string( &payload, "MaxOutstandingR2T=1" );
+						serializer_put_string( &payload, "MaxConnections=1" );
+						serializer_put_string( &payload, "DataPDUInOrder=Yes" );
+						serializer_put_string( &payload, "DataSequenceInOrder=Yes" );
 					} else {
 						serializer_put_uint16( &payload, client_version < 3 ? client_version : PROTOCOL_VERSION ); // XXX: Since messed up fuse client was messed up before :(
 						serializer_put_string( &payload, image->name );
