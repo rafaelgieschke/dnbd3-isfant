@@ -180,6 +180,7 @@ struct _dnbd3_client
 
 	bool iscsi;
 	uint32_t exp_cmd_sn;
+	uint32_t max_recv_data_segment_length;
 };
 
 // #######################################################

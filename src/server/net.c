@@ -184,7 +184,11 @@ static inline bool send_reply( dnbd3_client_t *client, dnbd3_reply_t *reply, con
 				break;
 			case CMD_GET_BLOCK:
 				bhs.opcode = ISCSI_OP_SCSI_DATAIN;
-				bhs.flags = ISCSI_FLAG_FINAL | ISCSI_DATAIN_STATUS;
+				// if ( reply->magic & 1 )
+				bhs.flags |= ISCSI_FLAG_FINAL;
+				if ( reply->magic & 1 ) bhs.flags |= ISCSI_DATAIN_STATUS;
+				((struct iscsi_bhs_data_in *)&bhs)->data_sn = htobe32( reply->magic >> 1 );
+				((struct iscsi_bhs_data_in *)&bhs)->buffer_offset = htobe32( reply->handle >> 32 );
 				break;
 			case CMD_KEEPALIVE:
 				return true;
@@ -436,7 +440,11 @@ void* net_handleNewConnection(void *clientPtr)
 						}
 					}
 				}
+				if (strncmp(keyValue, "MaxRecvDataSegmentLength=", strlen( "MaxRecvDataSegmentLength=" ) ) == 0) {
+					client->max_recv_data_segment_length = strtoul ( keyValue + strlen ( "MaxRecvDataSegmentLength=" ), NULL, 0 );
+				}
 			}
+			if ( client->max_recv_data_segment_length == 0 ) client->max_recv_data_segment_length = 8192;
 		} else {
 			client_version = serializer_get_uint16( &payload );
 			image_name = serializer_get_string( &payload );
@@ -551,7 +559,7 @@ void* net_handleNewConnection(void *clientPtr)
 			reply.handle = request.handle;
 			if ( likely ( request.cmd == CMD_GET_BLOCK ) ) {
 
-				const uint64_t offset = request.offset_small; // Copy to full uint64 to prevent repeated masking
+				uint64_t offset = request.offset_small; // Copy to full uint64 to prevent repeated masking
 				if ( unlikely( offset >= image->virtualFilesize ) ) {
 					// Sanity check
 					logadd( LOG_WARNING, "Client %s requested non-existent block", client->hostName );
@@ -599,6 +607,13 @@ void* net_handleNewConnection(void *clientPtr)
 					}
 				}
 
+				uint32_t request_size = request.size;
+				if ( client-> iscsi ) reply.magic = 0;
+				do {
+				if ( client->iscsi ) {
+					request.size = MIN( request_size, client->max_recv_data_segment_length );
+					if ( request.size == request_size ) reply.magic |= 1;
+				}
 				reply.cmd = CMD_GET_BLOCK;
 				reply.size = request.size;
 
@@ -680,6 +695,13 @@ void* net_handleNewConnection(void *clientPtr)
 				if ( lock ) mutex_unlock( &client->sendMutex );
 				// Global per-client counter
 				client->bytesSent += request.size; // Increase counter for statistics.
+				if ( client->iscsi ) {
+					reply.magic += 1 << 1;
+					reply.handle += (uint64_t)reply.size << 32;
+					offset += reply.size;
+					request_size -= reply.size;
+				}
+				} while ( client->iscsi && request_size > 0 );
 				continue;
 			}
 			// Any other command
@@ -981,7 +1003,20 @@ static void uplinkCallback(void *data, uint64_t handle, uint64_t start UNUSED, u
 		.size = length,
 	};
 	mutex_lock( &client->sendMutex );
-	send_reply( client, &reply, buffer );
+	if ( client->iscsi && reply.cmd == CMD_GET_BLOCK ) {
+		reply.magic = 0;
+		do {
+			reply.size = MIN( length, client->max_recv_data_segment_length );
+			if ( reply.size == length ) reply.magic |= 1;
+			send_reply( client, &reply, buffer );
+			reply.magic += 1 << 1;
+			reply.handle += (uint64_t)reply.size << 32;
+			buffer += reply.size;
+			length -= reply.size;
+		} while ( length > 0 );
+	} else {
+		send_reply( client, &reply, buffer );
+	}
 	if ( buffer == NULL ) {
 		shutdown( client->sock, SHUT_RDWR );
 	}
