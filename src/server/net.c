@@ -309,6 +309,11 @@ static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscs
 					request->size = ( req->cdb[7] << 8 | req->cdb[8] ) * 512;
 					request->offset = ( (uint64_t)req->cdb[2] << 24 | (uint64_t)req->cdb[3] << 16 | (uint64_t)req->cdb[4] << 8 | (uint64_t)req->cdb[5] ) * 512;
 					return true;
+				case SPDK_SBC_READ_16:
+					request->cmd = CMD_GET_BLOCK;
+					request->size = ( req->cdb[10] << 24 | req->cdb[11] << 16 | req->cdb[12] << 8 | req->cdb[13] ) * 512;
+					request->offset = ( (uint64_t)req->cdb[2] << 56 | (uint64_t)req->cdb[3] << 48 | (uint64_t)req->cdb[4] << 40 | (uint64_t)req->cdb[5] << 32 | (uint64_t)req->cdb[6] << 24 | (uint64_t)req->cdb[7] << 16 | (uint64_t)req->cdb[8] << 8 | (uint64_t)req->cdb[9] ) * 512;
+					return true;
 			}
 			logadd( LOG_WARNING, "Unsupported SCSI command 0x%02x 0x%02x received from iSCSI client %s", req->cdb[0], req->cdb[1], client->hostName );
 			resp.opcode = ISCSI_OP_SCSI_RSP;
