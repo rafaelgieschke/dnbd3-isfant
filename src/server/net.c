@@ -25,6 +25,7 @@
 #include "rpc.h"
 #include "altservers.h"
 #include "reference.h"
+#include "qcow2.h"
 
 #include "spdk/iscsi_spec.h"
 #include "spdk/scsi_spec.h"
@@ -637,53 +638,85 @@ void* net_handleNewConnection(void *clientPtr)
 					} else {
 						realBytes = (size_t)(image->realFilesize - offset);
 					}
-					while ( done < realBytes ) {
-						// TODO: Should we consider EOPNOTSUPP on BSD for sendfile and fallback to read/write?
-						// Linux would set EINVAL or ENOSYS instead, which it unfortunately also does for a couple of other failures :/
-						// read/write would kill performance anyways so a fallback would probably be of little use either way.
+					
+					// Handle qcow2 images differently
+					if ( image->qcow2 != NULL ) {
+						// For qcow2, we need to read into a buffer and then send
+						char buffer[131072]; // 128KB buffer
+						while ( done < realBytes ) {
+							size_t chunkSize = realBytes - done;
+							if ( chunkSize > sizeof(buffer) ) {
+								chunkSize = sizeof(buffer);
+							}
+							ssize_t bytes_read = qcow2_read( image->qcow2, buffer, chunkSize, offset + done );
+							if ( bytes_read <= 0 ) {
+								if ( lock ) mutex_unlock( &client->sendMutex );
+								logadd( LOG_DEBUG1, "qcow2_read failed for %s:%d at offset %" PRIu64,
+										image->name, image->rid, offset + done );
+								image->problem.read = true;
+								goto exit_client_cleanup;
+							}
+							ssize_t sent = send( client->sock, buffer, bytes_read, MSG_NOSIGNAL );
+							if ( sent <= 0 ) {
+								if ( lock ) mutex_unlock( &client->sendMutex );
+								if ( sent < 0 && errno != EPIPE && errno != ECONNRESET && errno != ESHUTDOWN ) {
+									logadd( LOG_DEBUG1, "Sending qcow2 data to %s failed (errno=%d)",
+											client->hostName, errno );
+								}
+								goto exit_client_cleanup;
+							}
+							done += sent;
+						}
+					} else {
+						// Regular raw image handling
+						while ( done < realBytes ) {
+							// TODO: Should we consider EOPNOTSUPP on BSD for sendfile and fallback to read/write?
+							// Linux would set EINVAL or ENOSYS instead, which it unfortunately also does for a couple of other failures :/
+							// read/write would kill performance anyways so a fallback would probably be of little use either way.
 #ifdef DNBD3_SERVER_AFL
-						char buf[1000];
-						size_t cnt = realBytes - done;
-						if ( cnt > 1000 ) {
-							cnt = 1000;
-						}
-						const ssize_t sent = pread( image_file, buf, cnt, foffset );
-						if ( sent > 0 ) {
-							//write( client->sock, buf, sent ); // This is not verified in any way, so why even do it...
-						} else {
-							const int err = errno;
+							char buf[1000];
+							size_t cnt = realBytes - done;
+							if ( cnt > 1000 ) {
+								cnt = 1000;
+							}
+							const ssize_t sent = pread( image_file, buf, cnt, foffset );
+							if ( sent > 0 ) {
+								//write( client->sock, buf, sent ); // This is not verified in any way, so why even do it...
+							} else {
+								const int err = errno;
 #elif defined(__linux__)
-						const ssize_t sent = sendfile( client->sock, image_file, &foffset, realBytes - done );
-						if ( sent <= 0 ) {
-							const int err = errno;
+							const ssize_t sent = sendfile( client->sock, image_file, &foffset, realBytes - done );
+							if ( sent <= 0 ) {
+								const int err = errno;
 #elif defined(__FreeBSD__)
-						off_t sent;
-						const int ret = sendfile( image_file, client->sock, foffset, realBytes - done, NULL, &sent, 0 );
-						if ( ret == -1 || sent == 0 ) {
-							const int err = errno;
-							if ( ret == -1 ) {
-								if ( err == EAGAIN || err == EINTR ) { // EBUSY? manpage doesn't explicitly mention *sent here.. But then again we dont set the according flag anyways
-									done += sent;
-									continue;
+							off_t sent;
+							const int ret = sendfile( image_file, client->sock, foffset, realBytes - done, NULL, &sent, 0 );
+							if ( ret == -1 || sent == 0 ) {
+								const int err = errno;
+								if ( ret == -1 ) {
+									if ( err == EAGAIN || err == EINTR ) { // EBUSY? manpage doesn't explicitly mention *sent here.. But then again we dont set the according flag anyways
+										done += sent;
+										continue;
+									}
+									sent = -1;
 								}
-								sent = -1;
-							}
 #endif
-							if ( lock ) mutex_unlock( &client->sendMutex );
-							if ( sent == -1 ) {
-								if ( err != EPIPE && err != ECONNRESET && err != ESHUTDOWN
-										&& err != EAGAIN && err != EWOULDBLOCK ) {
-									logadd( LOG_DEBUG1, "sendfile to %s failed (image to net. sent %d/%d, errno=%d)",
-											client->hostName, (int)done, (int)realBytes, err );
+								if ( lock ) mutex_unlock( &client->sendMutex );
+								if ( sent == -1 ) {
+									if ( err != EPIPE && err != ECONNRESET && err != ESHUTDOWN
+											&& err != EAGAIN && err != EWOULDBLOCK ) {
+										logadd( LOG_DEBUG1, "sendfile to %s failed (image to net. sent %d/%d, errno=%d)",
+												client->hostName, (int)done, (int)realBytes, err );
+									}
+									if ( err == EBADF || err == EFAULT || err == EINVAL || err == EIO ) {
+										logadd( LOG_INFO, "Disabling %s:%d", image->name, image->rid );
+										image->problem.read = true;
+									}
 								}
-								if ( err == EBADF || err == EFAULT || err == EINVAL || err == EIO ) {
-									logadd( LOG_INFO, "Disabling %s:%d", image->name, image->rid );
-									image->problem.read = true;
-								}
+								goto exit_client_cleanup;
 							}
-							goto exit_client_cleanup;
+							done += sent;
 						}
-						done += sent;
 					}
 					if ( request.size > (uint32_t)realBytes ) {
 						if ( !sendPadding( client->sock, request.size - (uint32_t)realBytes ) ) {

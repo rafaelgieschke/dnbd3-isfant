@@ -51,6 +51,7 @@ set(DNBD3_SERVER_SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/altservers.c
                               ${CMAKE_CURRENT_SOURCE_DIR}/integrity.c
                               ${CMAKE_CURRENT_SOURCE_DIR}/locks.c
                               ${CMAKE_CURRENT_SOURCE_DIR}/net.c
+                              ${CMAKE_CURRENT_SOURCE_DIR}/qcow2.c
                               ${CMAKE_CURRENT_SOURCE_DIR}/reference.c
                               ${CMAKE_CURRENT_SOURCE_DIR}/rpc.c
                               ${CMAKE_CURRENT_SOURCE_DIR}/server.c
@@ -67,6 +68,7 @@ set(DNBD3_SERVER_HEADER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/altservers.h
                               ${CMAKE_CURRENT_SOURCE_DIR}/integrity.h
                               ${CMAKE_CURRENT_SOURCE_DIR}/locks.h
                               ${CMAKE_CURRENT_SOURCE_DIR}/net.h
+                              ${CMAKE_CURRENT_SOURCE_DIR}/qcow2.h
                               ${CMAKE_CURRENT_SOURCE_DIR}/reference.h
                               ${CMAKE_CURRENT_SOURCE_DIR}/reftypes.h
                               ${CMAKE_CURRENT_SOURCE_DIR}/rpc.h
@@ -77,7 +79,7 @@ set(DNBD3_SERVER_HEADER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/altservers.h
 
 add_executable(dnbd3-server ${DNBD3_SERVER_SOURCE_FILES})
 target_include_directories(dnbd3-server PRIVATE ${JANSSON_INCLUDE_DIR})
-target_link_libraries(dnbd3-server dnbd3-version dnbd3-build dnbd3-shared picohttpparser Libatomic::Libatomic ${CMAKE_THREAD_LIBS_INIT} ${JANSSON_LIBRARIES})
+target_link_libraries(dnbd3-server dnbd3-version dnbd3-build dnbd3-shared picohttpparser Libatomic::Libatomic ${CMAKE_THREAD_LIBS_INIT} ${JANSSON_LIBRARIES} qcow)
 
 if(DNBD3_SERVER_FUSE)
     find_package(Fuse REQUIRED)
