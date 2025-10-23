@@ -87,6 +87,9 @@ static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscs
 static inline bool recv_request_header( dnbd3_client_t *client, dnbd3_request_t *request )
 {
 	if ( client->iscsi ) {
+		// struct iscsi_bhs: iSCSI Basic Header Segment (48 bytes)
+		// Contains the basic iSCSI protocol header with opcode, flags,
+		// data segment length, LUN, initiator task tag (itt), and sequence numbers
 		struct iscsi_bhs bhs;
 		if ( !recv_request_header_raw( client, &bhs, sizeof bhs ) ) return false;
 		if ( !translate_iscsi_to_dndb3( client, &bhs, request ) ) return false;
@@ -146,11 +149,19 @@ static inline bool send_reply_raw(int sock, const void *reply, size_t reply_size
 
 static inline bool sendPadding( const int fd, uint32_t bytes );
 
+/**
+ * Send iSCSI reply to client with optional payload.
+ * struct iscsi_bhs: iSCSI Basic Header Segment used for reply
+ * struct iscsi_bhs_scsi_resp: SCSI response PDU structure containing
+ *   - exp_cmd_sn: Expected command sequence number from initiator
+ *   - max_cmd_sn: Maximum command sequence number (window size control)
+ */
 static inline bool send_reply_iscsi( dnbd3_client_t *client, struct iscsi_bhs *reply, const void *payload, size_t size )
 {
 	reply->data_segment_len[0] = size >> 16;
 	reply->data_segment_len[1] = size >> 8;
 	reply->data_segment_len[2] = size >> 0;
+	// Cast to iscsi_bhs_scsi_resp to set SCSI-specific response fields
 	((struct iscsi_bhs_scsi_resp *)reply)->exp_cmd_sn = htobe32( client->exp_cmd_sn );
 	((struct iscsi_bhs_scsi_resp *)reply)->max_cmd_sn = htobe32( client->exp_cmd_sn + 0x100 );
 	if ( !send_reply_raw( client->sock, reply, sizeof *reply, payload, size ) ) {
@@ -170,11 +181,19 @@ static inline bool send_reply_iscsi_lock( dnbd3_client_t *client, struct iscsi_b
 /**
  * Send reply with optional payload. payload can be null. The caller has to
  * acquire the sendMutex first.
+ * 
+ * For iSCSI clients, translates dnbd3_reply_t to appropriate iSCSI PDU:
+ * - struct iscsi_bhs_data_in: Data-In PDU for CMD_GET_BLOCK responses
+ *   Contains data_sn (data sequence number) and buffer_offset for segmentation
+ * - struct iscsi_bhs_scsi_resp: SCSI Response PDU for status/errors
+ *   Contains SCSI status code and sense data for error conditions
  */
 static inline bool send_reply( dnbd3_client_t *client, dnbd3_reply_t *reply, const void *payload )
 {
 	const uint32_t size = reply->size;
 	if ( client->iscsi ) {
+		// struct iscsi_bhs: Generic iSCSI Basic Header Segment
+		// Initialized to zero, then populated based on command type
 		struct iscsi_bhs bhs = { 0 };
 		bhs.itt = reply->handle;
 		switch (reply->cmd) {
@@ -187,6 +206,9 @@ static inline bool send_reply( dnbd3_client_t *client, dnbd3_reply_t *reply, con
 				// if ( reply->magic & 1 )
 				bhs.flags |= ISCSI_FLAG_FINAL;
 				if ( reply->magic & 1 ) bhs.flags |= ISCSI_DATAIN_STATUS;
+				// struct iscsi_bhs_data_in: Data-In PDU for returning read data
+				// - data_sn: Sequence number for this data PDU (stored in reply->magic)
+				// - buffer_offset: Offset in the overall data transfer (from reply->handle)
 				((struct iscsi_bhs_data_in *)&bhs)->data_sn = htobe32( reply->magic >> 1 );
 				((struct iscsi_bhs_data_in *)&bhs)->buffer_offset = htobe32( reply->handle >> 32 );
 				break;
@@ -195,7 +217,9 @@ static inline bool send_reply( dnbd3_client_t *client, dnbd3_reply_t *reply, con
 			default: {
 				bhs.opcode = ISCSI_OP_SCSI_RSP;
 				bhs.flags = ISCSI_FLAG_FINAL;
+				// struct iscsi_bhs_scsi_resp: SCSI Response PDU with CHECK CONDITION status
 				((struct iscsi_bhs_scsi_resp *)&bhs)->status = SPDK_SCSI_STATUS_CHECK_CONDITION;
+				// SCSI sense data: error code, sense key, and additional sense codes
 				uint8_t data[20] = { (sizeof data - 2) >> 8, sizeof data - 2, 0x70, 0, SPDK_SCSI_SENSE_ILLEGAL_REQUEST, 0, 0, 0, 0, sizeof data - 2 - 8, 0, 0, 0, 0, SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE, SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE };
 				return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&bhs, &data, sizeof data );
 			}
@@ -226,8 +250,28 @@ void net_init()
 	mutex_init( &_clients_lock, LOCK_CLIENT_LIST );
 }
 
+/**
+ * Translate iSCSI request to dnbd3 request format.
+ * 
+ * This function processes iSCSI Basic Header Segments and SCSI commands,
+ * converting them to equivalent dnbd3 operations.
+ * 
+ * Key data structures:
+ * - struct iscsi_bhs: Basic iSCSI header (48 bytes) containing opcode, flags,
+ *   data length, LUN, ITT (initiator task tag), and sequence numbers
+ * - struct iscsi_bhs_scsi_req: SCSI command PDU containing CDB (Command Descriptor Block)
+ *   with the actual SCSI command bytes and expected transfer length
+ * - struct iscsi_bhs_scsi_resp: SCSI response PDU for sending status and sense data
+ * 
+ * @param client Client connection state
+ * @param bhs iSCSI Basic Header Segment from client
+ * @param request dnbd3 request structure to populate
+ * @return true if translation succeeded, false if request should be rejected
+ */
 static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscsi_bhs *bhs, dnbd3_request_t *request )
 {
+	// Update expected command sequence number for flow control
+	// struct iscsi_bhs_scsi_req->cmd_sn: Command sequence number from initiator
 	client->exp_cmd_sn = be32toh( ((struct iscsi_bhs_scsi_req*)bhs)->cmd_sn ) + ( bhs->immediate ? 0 : 1 );
 	request->magic = dnbd3_packet_magic;
 	request->cmd = CMD_KEEPALIVE;
@@ -236,6 +280,7 @@ static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscs
 	if ( bhs->total_ahs_len != 0 ) return false;
 	request->handle = bhs->itt;
 
+	// Prepare generic iSCSI response structure
 	struct iscsi_bhs resp = { 0 };
 	resp.itt = bhs->itt;
 	resp.flags = ISCSI_FLAG_FINAL;
@@ -255,6 +300,9 @@ static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscs
 			resp.opcode = ISCSI_OP_TASK_RSP;
 			return send_reply_iscsi_lock( client, &resp, NULL, 0 );
 		case ISCSI_OP_SCSI: {
+			// struct iscsi_bhs_scsi_req: SCSI Command PDU
+			// Contains CDB (Command Descriptor Block) with SCSI command bytes
+			// and expected_data_xfer_len for the data transfer size
 			struct iscsi_bhs_scsi_req *req = (struct iscsi_bhs_scsi_req *)bhs;
 			uint32_t expected_data_xfer_len = be32toh( req->expected_data_xfer_len );
 			resp.opcode = ISCSI_OP_SCSI_RSP;
@@ -270,9 +318,14 @@ static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscs
 					return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
 				}
 				case SPDK_SPC_INQUIRY: {
+					// struct spdk_scsi_cdb_inquiry: SCSI INQUIRY command structure
+					// - evpd: Enable Vital Product Data flag
+					// - page_code: Which VPD page to return (if evpd=1)
 					struct spdk_scsi_cdb_inquiry *inquiry = (struct spdk_scsi_cdb_inquiry *)&req->cdb;
 					switch ( inquiry->evpd & 0x01 ) {
 						case 0: {
+							// struct spdk_scsi_cdb_inquiry_data: Standard INQUIRY response
+							// Contains device type, version, vendor ID, product ID, etc.
 							struct spdk_scsi_cdb_inquiry_data data = { .peripheral_device_type = 0, .version = 4, .response = 2, .add_len = sizeof data - 4, .t10_vendor_id = "IET     ", .product_id = "VIRTUAL-DISK    ", .product_rev = "0001" };
 							return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
 						}
@@ -322,12 +375,16 @@ static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscs
 			logadd( LOG_WARNING, "Unsupported SCSI command 0x%02x 0x%02x received from iSCSI client %s", req->cdb[0], req->cdb[1], client->hostName );
 			resp.opcode = ISCSI_OP_SCSI_RSP;
 			resp.flags = ISCSI_FLAG_FINAL;
+			// struct iscsi_bhs_scsi_resp: Send CHECK CONDITION status with sense data
 			((struct iscsi_bhs_scsi_resp *)&resp)->status = SPDK_SCSI_STATUS_CHECK_CONDITION;
+			// Sense data format: error code 0x70, sense key ILLEGAL_REQUEST, ASC/ASCQ for unsupported command
 			uint8_t data[20] = { (sizeof data - 2) >> 8, sizeof data - 2, 0x70, 0, SPDK_SCSI_SENSE_ILLEGAL_REQUEST, 0, 0, 0, 0, sizeof data - 2 - 8, 0, 0, 0, 0, SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE, SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE };
 			return send_reply_iscsi_lock( client, &resp, &data, sizeof data );
 		}
     }
 	logadd( LOG_WARNING, "Unsupported iSCSI command 0x%02x received from iSCSI client %s", bhs->opcode, client->hostName );
+	// struct iscsi_bhs_reject: iSCSI REJECT PDU for unsupported commands
+	// Contains reason code and the rejected PDU header in the data segment
 	return send_reply_iscsi_lock( client, (struct iscsi_bhs *)&(struct iscsi_bhs_reject){ .opcode = ISCSI_OP_REJECT, .flags = ISCSI_FLAG_FINAL, .reason = ISCSI_REASON_CMD_NOT_SUPPORTED, .ffffffff = 0xffffffff }, bhs, sizeof *bhs );
 }
 
@@ -355,6 +412,8 @@ void* net_handleNewConnection(void *clientPtr)
 
 		if ( ((char*)&request)[0] == 'C' ) {
 			client->iscsi = 1;
+			// struct iscsi_bhs: Read remaining bytes of iSCSI Basic Header Segment
+			// iSCSI BHS is 48 bytes, we already read first 24 bytes into request
 			struct iscsi_bhs bhs;
 			memcpy( &bhs, &request, sizeof request );
 			const int ret = (int)recv( client->sock, (char*)&bhs + sizeof request, sizeof bhs - sizeof request, MSG_WAITALL );
