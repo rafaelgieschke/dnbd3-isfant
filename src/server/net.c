@@ -273,7 +273,7 @@ static inline bool translate_iscsi_to_dndb3( dnbd3_client_t *client, struct iscs
 					struct spdk_scsi_cdb_inquiry *inquiry = (struct spdk_scsi_cdb_inquiry *)&req->cdb;
 					switch ( inquiry->evpd & 0x01 ) {
 						case 0: {
-							struct spdk_scsi_cdb_inquiry_data data = { .peripheral_device_type = 0, .version = 4, .response = 2, .add_len = sizeof data - 4, .t10_vendor_id = "IET     ", .product_id = "VIRTUAL-DISK    ", .product_rev = "0001" };
+							struct spdk_scsi_cdb_inquiry_data data = { .peripheral_device_type = 0, .version = 4, .response = 2, .add_len = sizeof data - 5, .t10_vendor_id = "IET     ", .product_id = "VIRTUAL-DISK    ", .product_rev = "0001" };
 							return send_reply_iscsi_lock( client, &resp, &data, MIN( sizeof data, expected_data_xfer_len ) );
 						}
 						case 1: {
