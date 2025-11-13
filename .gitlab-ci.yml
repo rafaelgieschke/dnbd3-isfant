@@ -1,0 +1,35 @@
+test:
+  image: ubuntu
+  script: |
+    set -x
+
+    apt-get update
+    apt-get install -y git \
+      make \
+      cmake \
+      gcc \
+      clang-format \
+      linux-headers-generic \
+      libfuse-dev \
+      libjansson-dev \
+      rpm \
+      libcurl4-openssl-dev
+    cmake -DCMAKE_BUILD_TYPE=Release -DDNBD3_KERNEL_MODULE=OFF .
+    make dnbd3-server
+
+    apt-get install -y linux-generic qemu-system git
+    git clone https://github.com/rafaelgieschke/qemu-exec
+    apt-get install -y kmod open-iscsi libiscsi-bin
+    qemu-exec/qemu-exec-kvm -smp "$(nproc)" -- ./contrib/test-performance
+
+    url_prefix="$CI_SERVER_PROTOCOL://$CI_PROJECT_ROOT_NAMESPACE.$CI_PAGES_DOMAIN/-/${CI_PROJECT_PATH#*/}/-/jobs/$CI_JOB_ID/artifacts"
+    cat >"$CI_PROJECT_DIR/artifacts.json" <<EOF
+      {"section": [
+        {"external_link": {"label": "Performance report", "url": "$url_prefix/performance.html"}}
+      ]}
+    EOF
+  artifacts:
+    paths:
+      - performance.html
+    reports:
+      annotations: artifacts.json

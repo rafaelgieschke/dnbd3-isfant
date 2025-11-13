@@ -1,0 +1,30 @@
+#!/bin/sh -x
+selfDir="$(dirname -- "$(realpath -- "$0")")"
+
+data="/tmp"
+config="$selfDir/../pkg/config"
+
+mkdir -p -- "$data"
+mount -t tmpfs -- / "$data"
+truncate -s 10G -- "$data/test.r1"
+
+sed -Ei "s#^basePath=.*#basePath=$(realpath -- "$data")#" -- "$config/server.conf"
+cat -- "$config/server.conf"
+
+"$selfDir/../src/server/dnbd3-server" -nc "$config" &
+while ! grep -qF ":$(printf %04X 5003)" /proc/net/tcp; do sleep 1; done
+
+modprobe iscsi_tcp
+iscsistart -i initiator -g 1 -p 5003 -a 127.0.0.1 -t test
+device="$(basename -- /sys/class/iscsi_session/session*/device/target*/*/block/*)"
+sleep 3
+
+echo "<plaintext>" > performance.html
+(
+    iscsi-perf -t 5 iscsi://localhost:5003/test/0
+    dd status=progress if="/dev/$device" of=/dev/null
+    dd status=progress if="/dev/$device" of=/dev/null bs=1M
+    dd status=progress if="/dev/$device" of=/dev/null bs=16M
+) 2>&1 | tee -a performance.html
+
+dmesg
