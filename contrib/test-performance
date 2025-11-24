@@ -1,26 +1,27 @@
 #!/bin/sh -x
 selfDir="$(dirname -- "$(realpath -- "$0")")"
 
-data="/tmp"
+data="$(mktemp -d)"
 config="$selfDir/../pkg/config"
 
-mkdir -p -- "$data"
 mount -t tmpfs -- / "$data"
 truncate -s 10G -- "$data/test.r1"
 
 sed -Ei "s#^basePath=.*#basePath=$(realpath -- "$data")#" -- "$config/server.conf"
 cat -- "$config/server.conf"
 
-"$selfDir/../src/server/dnbd3-server" -nc "$config" &
+"$selfDir/../src/server/dnbd3-server" -nc "$config" & pid="$!"
 while ! grep -qF ":$(printf %04X 5003)" /proc/net/tcp; do sleep 1; done
 
 modprobe iscsi_tcp
 iscsistart -i initiator -g 1 -p 5003 -a 127.0.0.1 -t test
-device="$(basename -- /sys/class/iscsi_session/session*/device/target*/*/block/*)"
+deviceSysfs="$(printf %s /sys/class/iscsi_session/session*/device/target*/*/block/*)"
+device="$(basename -- "$deviceSysfs")"
 sleep 3
 
 echo "<plaintext>" > performance.html
 (
+    uname -a
     iscsi-perf -t 5 iscsi://localhost:5003/test/0
     dd status=progress if="/dev/$device" of=/dev/null
     dd status=progress if="/dev/$device" of=/dev/null bs=1M
@@ -28,3 +29,13 @@ echo "<plaintext>" > performance.html
 ) 2>&1 | tee -a performance.html
 
 dmesg
+
+# echo 1 >"$deviceSysfs/../../delete"
+
+kill -- "$pid"
+umount -l -- "$data"
+
+sessionId="${deviceSysfs%%/device/*}"
+sessionId="${sessionId##*/session}"
+test -e "$selfDir/iscsi-destroy/iscsi-destroy" || go -C "$selfDir/iscsi-destroy" build
+"$selfDir/iscsi-destroy/iscsi-destroy" "$sessionId" || :
