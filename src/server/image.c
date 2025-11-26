@@ -5,6 +5,7 @@
 #include "locks.h"
 #include "integrity.h"
 #include "altservers.h"
+#include "qcow2.h"
 #include <dnbd3/shared/protocol.h>
 #include <dnbd3/shared/timing.h>
 #include <dnbd3/shared/crc32.h>
@@ -648,6 +649,7 @@ static dnbd3_image_t* image_free(dnbd3_image_t *image)
 	image->name = NULL;
 	mutex_unlock( &image->lock );
 	if ( image->readFd != -1 ) close( image->readFd );
+	if ( image->qcow2 != NULL ) qcow2_close( image->qcow2 );
 	mutex_destroy( &image->lock );
 	free( image );
 	return NULL ;
@@ -822,28 +824,54 @@ static bool image_load(char *base, char *path, bool withUplink)
 	existing = image_get( imgName, (uint16_t)revision, true );
 
 	// ### Now load the actual image related data ###
-	if ( fdImage == -1 ) {
-		fdImage = open( path, O_RDONLY );
-	}
-	if ( fdImage == -1 ) {
-		if ( errno != ENOENT ) {
-			logadd( LOG_ERROR, "[load] Cannot open '%s' for reading (errno=%d)", path, errno );
+	// Check if this is a qcow2 file
+	bool isQcow2 = qcow2_is_qcow2( path );
+	uint64_t realFilesize = 0;
+	uint64_t virtualFilesize = 0;
+	qcow2_handle_t *qcowHandle = NULL;
+
+	if ( isQcow2 ) {
+		// Open qcow2 file and get its virtual size
+		qcowHandle = qcow2_open( path );
+		if ( qcowHandle == NULL ) {
+			logadd( LOG_ERROR, "Failed to open qcow2 file '%s'", path );
+			goto load_error;
 		}
-		goto load_error;
-	}
-	// Determine file size
-	const off_t seekret = lseek( fdImage, 0, SEEK_END );
-	if ( seekret < 0 ) {
-		logadd( LOG_ERROR, "Could not seek to end of file '%s'", path );
-		goto load_error;
-	} else if ( seekret == 0 ) {
-		logadd( LOG_WARNING, "Empty image file '%s'", path );
-		goto load_error;
-	}
-	const uint64_t realFilesize = (uint64_t)seekret;
-	const uint64_t virtualFilesize = ( realFilesize + (DNBD3_BLOCK_SIZE - 1) ) & ~(DNBD3_BLOCK_SIZE - 1);
-	if ( realFilesize != virtualFilesize ) {
-		logadd( LOG_DEBUG1, "Image size of '%s' is %" PRIu64 ", virtual size: %" PRIu64, path, realFilesize, virtualFilesize );
+		realFilesize = qcow2_get_size( qcowHandle );
+		if ( realFilesize == 0 ) {
+			logadd( LOG_ERROR, "Failed to get qcow2 file size for '%s'", path );
+			qcow2_close( qcowHandle );
+			goto load_error;
+		}
+		virtualFilesize = ( realFilesize + (DNBD3_BLOCK_SIZE - 1) ) & ~(DNBD3_BLOCK_SIZE - 1);
+		logadd( LOG_INFO, "Loaded qcow2 image '%s' with virtual size %" PRIu64, path, realFilesize );
+		// For qcow2, we don't use fdImage
+		fdImage = -1;
+	} else {
+		// Regular raw image handling
+		if ( fdImage == -1 ) {
+			fdImage = open( path, O_RDONLY );
+		}
+		if ( fdImage == -1 ) {
+			if ( errno != ENOENT ) {
+				logadd( LOG_ERROR, "[load] Cannot open '%s' for reading (errno=%d)", path, errno );
+			}
+			goto load_error;
+		}
+		// Determine file size
+		const off_t seekret = lseek( fdImage, 0, SEEK_END );
+		if ( seekret < 0 ) {
+			logadd( LOG_ERROR, "Could not seek to end of file '%s'", path );
+			goto load_error;
+		} else if ( seekret == 0 ) {
+			logadd( LOG_WARNING, "Empty image file '%s'", path );
+			goto load_error;
+		}
+		realFilesize = (uint64_t)seekret;
+		virtualFilesize = ( realFilesize + (DNBD3_BLOCK_SIZE - 1) ) & ~(DNBD3_BLOCK_SIZE - 1);
+		if ( realFilesize != virtualFilesize ) {
+			logadd( LOG_DEBUG1, "Image size of '%s' is %" PRIu64 ", virtual size: %" PRIu64, path, realFilesize, virtualFilesize );
+		}
 	}
 
 	// 1. Allocate memory for the cache map if the image is incomplete
@@ -904,6 +932,7 @@ static bool image_load(char *base, char *path, bool withUplink)
 	image->rid = (uint16_t)revision;
 	image->users = 0;
 	image->readFd = -1;
+	image->qcow2 = qcowHandle;
 	timing_get( &image->nextCompletenessEstimate );
 	image->completenessEstimate = -1;
 	mutex_init( &image->lock, LOCK_IMAGE );
@@ -927,15 +956,26 @@ static bool image_load(char *base, char *path, bool withUplink)
 	}
 
 	// ### Reaching this point means loading succeeded
-	image->readFd = fdImage;
+	if ( isQcow2 ) {
+		// For qcow2, we use the qcow2 handle, not a file descriptor
+		image->readFd = -1;
+		qcowHandle = NULL; // Prevent cleanup, as it's now owned by the image
+	} else {
+		image->readFd = fdImage;
+		fdImage = -1; // Keep fd for reading, prevent cleanup
+	}
 	if ( image_addToList( image ) ) {
-		// Keep fd for reading
-		fdImage = -1;
 		// Check CRC32
 		image_checkRandomBlocks( image, 4, -1 );
 	} else {
 		logadd( LOG_ERROR, "Image list full: Could not add image %s", path );
-		image->readFd = -1; // Keep fdImage instead, will be closed below
+		if ( isQcow2 ) {
+			// Reclaim qcow2 handle for cleanup
+			qcowHandle = image->qcow2;
+			image->qcow2 = NULL;
+		} else {
+			image->readFd = -1; // Keep fdImage instead, will be closed below
+		}
 		image = image_free( image );
 		goto load_error;
 	}
@@ -948,6 +988,7 @@ load_error: ;
 	if ( crc32list != NULL ) free( crc32list );
 	if ( cache != NULL ) free( cache );
 	if ( fdImage != -1 ) close( fdImage );
+	if ( qcowHandle != NULL ) qcow2_close( qcowHandle );
 	return function_return;
 }
 

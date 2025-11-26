@@ -17,6 +17,7 @@ typedef struct timespec ticks;
 typedef struct _dnbd3_uplink dnbd3_uplink_t;
 typedef struct _dnbd3_image dnbd3_image_t;
 typedef struct _dnbd3_client dnbd3_client_t;
+typedef struct _qcow2_handle qcow2_handle_t;
 
 typedef void (*uplink_callback)(void *data, uint64_t handle, uint64_t start, uint32_t length, const char *buffer);
 
@@ -147,6 +148,7 @@ struct _dnbd3_image
 	uint32_t *crc32;       // list of crc32 checksums for each 16MiB block in image
 	uint32_t masterCrc32;  // CRC-32 of the crc-32 list
 	int readFd;            // used to read the image. Used from multiple threads, so use atomic operations (pread et al)
+	qcow2_handle_t *qcow2; // qcow2 file handle if this is a qcow2 image, NULL otherwise
 	atomic_int completenessEstimate; // Completeness estimate in percent
 	atomic_int users;      // clients currently using this image. XXX Lock on imageListLock when modifying and checking whether the image should be freed. Reading it elsewhere is fine without the lock.
 	int id;                // Unique ID of this image. Only unique in the context of this running instance of DNBD3-Server

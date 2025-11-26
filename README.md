@@ -9,6 +9,17 @@ This repository contains the source code for the following dnbd3 components:
   - **dnbd3-fuse**: Fuse client for dnbd3
   - **dnbd3-server**: Server to serve virtual disk images for dnbd3
 
+## Features
+
+### QCOW2 Support
+
+The dnbd3-server now supports QCOW2 (QEMU Copy-On-Write) disk images in addition to raw disk images. When a QCOW2 image is detected, the server automatically:
+- Opens and reads the QCOW2 format using libqcow
+- Transparently serves the virtual disk content to clients as a raw disk
+- Handles the QCOW2 format translation internally, making it invisible to clients
+
+This allows you to serve space-efficient QCOW2 images without requiring clients to understand the QCOW2 format.
+
 The dnbd3 components have been built/tested on the following Linux kernel versions and Unix distributions:
 
   - Generic/Vanilla Kernel **4.9** to **6.12**
@@ -38,6 +49,7 @@ pacman -S git \
           linux-headers \  # or linux-lts-headers
           fuse2 \
           jansson \
+          libqcow \
           afl \
           dpkg \
           rpm-tools
@@ -53,6 +65,7 @@ apt-get install git \
                 raspberrypi-kernel-headers \
                 libfuse-dev \
                 libjansson-dev \
+                libqcow-dev \
                 afl \
                 rpm
 ```
@@ -67,6 +80,7 @@ apt-get install git \
                 linux-headers-generic \
                 libfuse-dev \
                 libjansson-dev \
+                libqcow-dev \
                 rpm
 ```
 
@@ -82,6 +96,7 @@ apt-get install git \
                 linux-headers-generic \
                 libfuse-dev \
                 libjansson-dev \
+                libqcow-dev \
                 afl \
                 rpm
 ```
@@ -98,6 +113,7 @@ yum install git \
             elfutils-libelf-devel \
             fuse-devel \
             jansson-devel \
+            libqcow-devel \
             libatomic \
             rpm-build
 ```
